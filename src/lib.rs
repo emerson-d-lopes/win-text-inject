@@ -93,17 +93,19 @@ pub enum Chord {
 impl Chord {
     /// The chord most likely to paste in the given application.
     ///
-    /// Terminals bind Ctrl+V to something else or nothing; several Electron editors are documented
-    /// as needing Shift+Insert instead.
+    /// Every entry here is verified against the real application (see `examples/real_app_test.rs`),
+    /// not taken from documentation. VS Code was previously listed as needing Shift+Insert on the
+    /// strength of a vendor support page; testing showed Shift+Insert does nothing in the editor
+    /// and Ctrl+V works. That claim appears to describe the integrated terminal, not the editor.
     pub fn for_exe(exe: &str) -> Self {
         match exe {
+            // Terminals bind Ctrl+V to a control character or to nothing.
             "windowsterminal.exe"
             | "conhost.exe"
             | "mintty.exe"
             | "putty.exe"
             | "alacritty.exe"
             | "wezterm-gui.exe" => Chord::CtrlShiftV,
-            "code.exe" | "cursor.exe" | "windsurf.exe" => Chord::ShiftInsert,
             _ => Chord::CtrlV,
         }
     }
@@ -246,18 +248,38 @@ pub fn inject(target: &Target, text: &str, options: Options) -> Result<Outcome, 
                 let offer = delayed::Offer::publish(text)?;
                 std::thread::sleep(options.pre_paste);
                 modifiers::sanitize()?;
+
+                // Anything that reads the clipboard satisfies the render, so a read observed before
+                // the paste says nothing about the target. A clipboard manager that archives every
+                // change will otherwise confirm a paste that never happened.
+                offer.mark_paste_sent();
                 send_chord(chord)?;
 
-                // Not wait_for_read: one render does not mean the paste finished. Chromium probes
-                // the clipboard before the read that actually populates the field, so restoring
-                // after the first render reintroduces the very bug this path exists to fix.
-                let reads =
-                    offer.wait_for_reads_to_settle(options.read_timeout, options.read_quiet);
+                // Not a single render: Chromium probes the clipboard before the read that actually
+                // populates the field, so restoring after the first one reintroduces the very bug
+                // this path exists to fix.
+                let reads = offer.wait_for_target_read(options.read_timeout, options.read_quiet);
                 let read_confirmed = reads.is_some();
 
-                // Restoring after a timeout would be guessing again, and would destroy the user's
-                // clipboard for a paste that never landed. Leave the transcript in place instead.
-                if read_confirmed {
+                // Three cases, and they need different handling:
+                //
+                // 1. A read after the paste. Confident; restore now, sequenced after the read.
+                // 2. No such read, but the promise was consumed before the paste (a clipboard
+                //    manager archived it). The target's read is unobservable, so fall back to the
+                //    timer. Worse than case 1, but not restoring at all would permanently destroy
+                //    the user's clipboard on every dictation while a manager is running.
+                // 3. No read at all. The paste most likely never landed, so leave the transcript on
+                //    the clipboard for the user to paste manually rather than discarding it.
+                let should_restore = if read_confirmed {
+                    true
+                } else if offer.consumed_before_paste() {
+                    std::thread::sleep(options.post_paste);
+                    true
+                } else {
+                    false
+                };
+
+                if should_restore {
                     if let Some(snapshot) = snapshot {
                         let _ = snapshot.restore();
                     }
@@ -316,9 +338,11 @@ mod tests {
     }
 
     #[test]
-    fn electron_editors_get_shift_insert() {
-        assert_eq!(Chord::for_exe("code.exe"), Chord::ShiftInsert);
-        assert_eq!(Chord::for_exe("cursor.exe"), Chord::ShiftInsert);
+    fn vs_code_gets_ctrl_v_not_shift_insert() {
+        // Verified against real VS Code: Shift+Insert does nothing in the editor and the paste
+        // never fires. The Shift+Insert advice in vendor docs describes the integrated terminal.
+        assert_eq!(Chord::for_exe("code.exe"), Chord::CtrlV);
+        assert_eq!(Chord::for_exe("cursor.exe"), Chord::CtrlV);
     }
 
     #[test]

@@ -49,6 +49,9 @@ struct State {
     render_count: u32,
     /// Tick of the most recent render, for debouncing the restore.
     last_render: Option<std::time::Instant>,
+    /// Render count observed when the paste was triggered. Reads at or below this were caused by
+    /// something other than the paste (a clipboard manager, history service) and prove nothing.
+    baseline: u32,
 }
 
 fn state() -> &'static (Mutex<State>, Condvar) {
@@ -60,6 +63,7 @@ fn state() -> &'static (Mutex<State>, Condvar) {
                 rendered: false,
                 render_count: 0,
                 last_render: None,
+                baseline: 0,
             }),
             Condvar::new(),
         )
@@ -212,6 +216,7 @@ impl Offer {
             s.rendered = false;
             s.render_count = 0;
             s.last_render = None;
+            s.baseline = 0;
         }
 
         {
@@ -292,6 +297,55 @@ impl Offer {
     /// Number of times a consumer has asked for the data since publishing.
     pub fn read_count(&self) -> u32 {
         state().0.lock().map(|s| s.render_count).unwrap_or(0)
+    }
+
+    /// Record that the paste has now been triggered.
+    ///
+    /// Anything that reads the clipboard — a clipboard manager, a history service — satisfies the
+    /// render, so a read observed *before* the paste says nothing about the target. Marking here
+    /// lets [`Offer::wait_for_target_read`] ignore those and wait for a read caused by the paste.
+    pub fn mark_paste_sent(&self) {
+        if let Ok(mut s) = state().0.lock() {
+            s.baseline = s.render_count;
+        }
+    }
+
+    /// Whether the promise was already materialized before the paste was sent.
+    ///
+    /// Once *any* consumer forces the render, the clipboard holds real data and Windows sends no
+    /// further `WM_RENDERFORMAT`. The target's read is then unobservable — not delayed, gone. A
+    /// clipboard manager that archives every change causes exactly this, so callers must have a
+    /// fallback rather than waiting for a signal that can never arrive.
+    pub fn consumed_before_paste(&self) -> bool {
+        state().0.lock().map(|s| s.baseline > 0).unwrap_or(false)
+    }
+
+    /// Wait for a read that happened *after* [`Offer::mark_paste_sent`], then for reads to settle.
+    ///
+    /// Cannot be satisfied by a clipboard manager that read the promise the moment it was
+    /// published. Returns `None` if no such read arrives, which includes the case where the promise
+    /// was already consumed — check [`Offer::consumed_before_paste`] to tell those apart.
+    pub fn wait_for_target_read(&self, timeout: Duration, quiet: Duration) -> Option<u32> {
+        let (lock, cvar) = state();
+        {
+            let guard = lock.lock().ok()?;
+            let (guard, timed_out) = cvar
+                .wait_timeout_while(guard, timeout, |s| s.render_count <= s.baseline)
+                .ok()?;
+            if timed_out.timed_out() && guard.render_count <= guard.baseline {
+                return None;
+            }
+        }
+        loop {
+            let last = { lock.lock().ok()?.last_render? };
+            let elapsed = last.elapsed();
+            if elapsed >= quiet {
+                break;
+            }
+            std::thread::sleep(quiet - elapsed);
+        }
+        let s = lock.lock().ok()?;
+        Some(s.render_count - s.baseline)
     }
 }
 

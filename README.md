@@ -100,9 +100,33 @@ Tested against real Chrome, restoring after the first `WM_RENDERFORMAT` **still 
 
 The fix is to wait for renders to go *quiet*, not for the first one: `Offer::wait_for_reads_to_settle`. This is not a race-the-target delay — the clock starts from an observed read, so it does not need per-machine tuning.
 
-Verified end to end against Chrome: transcript delivered to the textarea, previous clipboard restored, read confirmed. `cargo run --example real_app_test -- --attach chrome.exe`.
+### Verified against real applications
 
-Note `WM_GETTEXT` cannot read Chromium or modern WinUI text, so the harness reports INDETERMINATE for those and the field must be checked directly.
+`cargo run --example real_app_test -- --attach <exe>` injects through the full public API and reads the result back by making the app copy its own field to the clipboard — the only verification that works uniformly across Win32, Chromium and Electron. `WM_GETTEXT` and UI Automation both fail on at least one of those.
+
+| Application | Chord | Delivered | Exact | Clipboard kept | Read confirmed |
+|---|---|---|---|---|---|
+| Chrome | Ctrl+V | yes | yes | yes | yes |
+| VS Code | Ctrl+V | yes | yes | yes | yes |
+| Notepad | Ctrl+V | yes | yes | yes | yes |
+| Windows Terminal | Ctrl+Shift+V | yes | n/a | yes | yes |
+
+Every chord in the table is verified this way, not taken from documentation. VS Code was originally listed as needing Shift+Insert on the strength of a vendor support page; testing showed Shift+Insert does nothing in the editor — the paste never fires at all. That advice appears to describe the integrated terminal.
+
+### Clipboard managers
+
+A manager that reads the clipboard on every change interacts with delayed rendering in a way worth stating plainly. Tested with `examples/fake_clipboard_manager.rs` in both modes.
+
+**A well-behaved manager** — one that checks the opt-out formats — does not read our promise at all, so nothing changes. Windows' own clipboard history behaves this way: with history enabled, `examples/watcher_probe.rs` reports no reader consuming the promise. The privacy formats protect the correctness signal as a side effect.
+
+**A naive manager** that ignores the opt-out formats does two things:
+
+1. **It captures the transcript.** The opt-out formats are a cooperative protocol, not enforcement. This is a real and unavoidable privacy limitation — do not claim otherwise.
+2. **It consumes the promise before the paste.** Once *anything* renders it, the clipboard holds real data and Windows sends no further `WM_RENDERFORMAT`, so the target's read becomes unobservable — not delayed, gone.
+
+Case 2 is why `mark_paste_sent` exists: reads before the paste are ignored, so a manager cannot forge a confirmation. When the promise was consumed early, `inject` detects it via `consumed_before_paste` and falls back to the timer-based restore, reporting `read_confirmed: false` honestly rather than pretending. Verified: with a naive manager running, delivery and clipboard restore still succeed, and the outcome correctly reports that the read could not be confirmed.
+
+If no read is observed at all, the paste most likely never landed, so the transcript is deliberately left on the clipboard rather than discarded.
 
 ## Status
 
