@@ -14,7 +14,7 @@ one paste in four.
 Success is now established from observable clipboard state (we own the clipboard
 and `CF_UNICODETEXT` is advertised) rather than from the return value.
 
-## 0.1.0 — unreleased
+## 0.1.0
 
 First release.
 
