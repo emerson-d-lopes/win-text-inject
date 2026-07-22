@@ -20,7 +20,8 @@ use std::time::Duration;
 use windows::core::w;
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardOwner, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardOwner, IsClipboardFormatAvailable, OpenClipboard,
+    SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -228,22 +229,26 @@ impl Offer {
                     EmptyClipboard().map_err(Error::Clipboard)?;
                     // NULL data is the promise; Windows comes back with WM_RENDERFORMAT.
                     //
-                    // For delayed rendering SetClipboardData returns NULL on *success*, which the
-                    // bindings surface as Err with a zeroed last-error. Only a non-zero code is a real
-                    // failure here.
-                    if let Err(e) = SetClipboardData(CF_UNICODETEXT_PUBLIC, None) {
-                        if e.code().0 != 0 {
-                            return Err(Error::Clipboard(e));
-                        }
-                    }
+                    // The return value cannot detect failure here. For delayed rendering
+                    // SetClipboardData returns NULL on *success*, which the bindings surface as an
+                    // Err, and Win32 does not reset the thread's last-error on success -- so a
+                    // stale code from an unrelated earlier call reads as a failure that never
+                    // happened. Observed in the wild as ERROR_NOT_FOUND (0x80070490) on roughly one
+                    // paste in four. Clipboard ownership is verified below instead, which is the
+                    // actual post-condition.
+                    let _ = SetClipboardData(CF_UNICODETEXT_PUBLIC, None);
                     crate::clipboard::attach_privacy_formats();
                     Ok::<(), Error>(())
                 })()
             };
             result?;
 
-            // Ownership is the real confirmation the promise was accepted.
-            if unsafe { GetClipboardOwner() }.unwrap_or_default() != hwnd {
+            // Ownership plus format availability is the real confirmation the promise was
+            // accepted. Both are observable facts about the clipboard rather than an error code
+            // that may be stale.
+            let owned = unsafe { GetClipboardOwner() }.unwrap_or_default() == hwnd;
+            let advertised = unsafe { IsClipboardFormatAvailable(CF_UNICODETEXT_PUBLIC) }.is_ok();
+            if !owned || !advertised {
                 return Err(Error::OwnerWindowFailed);
             }
         }
