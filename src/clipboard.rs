@@ -43,13 +43,20 @@ const OPEN_RETRIES: u32 = 5;
 const OPEN_BACKOFF_MS: u64 = 12;
 
 /// RAII guard so the clipboard is always closed, including on early return or panic.
-struct ClipboardGuard;
+pub(crate) struct ClipboardGuard;
 
 impl ClipboardGuard {
     fn open() -> Result<Self, Error> {
+        Self::open_owned_by(HWND::default())
+    }
+
+    /// Open with `owner` recorded as the clipboard owner, so delayed-render messages are routed to
+    /// it. The retry loop matters: the clipboard is a global lock and a contended open otherwise
+    /// fails outright with `ERROR_ACCESS_DENIED`.
+    pub(crate) fn open_owned_by(owner: HWND) -> Result<Self, Error> {
         let mut last = windows::core::Error::empty();
         for attempt in 0..OPEN_RETRIES {
-            match unsafe { OpenClipboard(Some(HWND::default())) } {
+            match unsafe { OpenClipboard(Some(owner)) } {
                 Ok(()) => return Ok(Self),
                 Err(e) => {
                     last = e;
@@ -102,29 +109,42 @@ pub fn set_text_private(text: &str) -> Result<(), Error> {
     let _guard = ClipboardGuard::open()?;
     unsafe {
         EmptyClipboard().map_err(Error::Clipboard)?;
-
         let payload = alloc_global(&utf16_bytes(text))?;
-        SetClipboardData(CF_UNICODETEXT, Some(HANDLE(payload.0)))
-            .map_err(Error::Clipboard)?;
-
-        for (index, name) in PRIVACY_FORMATS.iter().enumerate() {
-            let id = RegisterClipboardFormatW(*name);
-            if id == 0 {
-                continue;
-            }
-            // A registered format that fails to attach is not fatal: the text is already on the
-            // clipboard and a missing opt-out is a privacy downgrade, not a functional break.
-            let data = match privacy_payload(index) {
-                Some(dword) => match alloc_global(&dword.to_le_bytes()) {
-                    Ok(h) => Some(HANDLE(h.0)),
-                    Err(_) => continue,
-                },
-                None => None,
-            };
-            let _ = SetClipboardData(id, data);
-        }
+        SetClipboardData(CF_UNICODETEXT, Some(HANDLE(payload.0))).map_err(Error::Clipboard)?;
+        attach_privacy_formats();
     }
     Ok(())
+}
+
+/// Attach the four opt-out formats to the currently open clipboard.
+///
+/// Caller must already hold the clipboard open. Failures are swallowed deliberately: the text is
+/// already published, and a missing opt-out is a privacy downgrade rather than a functional break.
+pub(crate) fn attach_privacy_formats() {
+    for (index, name) in PRIVACY_FORMATS.iter().enumerate() {
+        let id = unsafe { RegisterClipboardFormatW(*name) };
+        if id == 0 {
+            continue;
+        }
+        let data = match privacy_payload(index) {
+            Some(dword) => match alloc_global(&dword.to_le_bytes()) {
+                Ok(h) => Some(HANDLE(h.0)),
+                Err(_) => continue,
+            },
+            None => None,
+        };
+        let _ = unsafe { SetClipboardData(id, data) };
+    }
+}
+
+pub(crate) const CF_UNICODETEXT_PUBLIC: u32 = CF_UNICODETEXT;
+
+pub(crate) fn alloc_global_public(bytes: &[u8]) -> Result<HGLOBAL, Error> {
+    alloc_global(bytes)
+}
+
+pub(crate) fn utf16_bytes_public(text: &str) -> Vec<u8> {
+    utf16_bytes(text)
 }
 
 /// A best-effort snapshot of the clipboard's text content plus the sequence number observed when it

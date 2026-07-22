@@ -79,7 +79,14 @@ fn main() -> Result<(), win_text_inject::Error> {
     }
 
     let snapshot = win_text_inject::clipboard::Snapshot::capture()?;
-    println!("\nround-trip: {}", if snapshot_matches(&snapshot, secret) { "ok" } else { "MISMATCH" });
+    println!(
+        "\nround-trip: {}",
+        if snapshot_matches(&snapshot, secret) {
+            "ok"
+        } else {
+            "MISMATCH"
+        }
+    );
 
     println!(
         "\nresult: {}",

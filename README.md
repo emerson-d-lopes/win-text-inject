@@ -69,11 +69,34 @@ Every event this crate synthesizes carries `INJECT_TAG` in `dwExtraInfo`. If you
 
 **It does not implement a TSF text service.** Text Services Framework is the API Microsoft actually recommends for dictation, and it is how Win+H and Voice Access inject so cleanly. But TSF insertion requires being a TIP loaded in-process inside every target application — an in-proc COM DLL, registered, built per architecture, signed. That is a separate project.
 
-**It does not eliminate the clipboard race, only the data loss from it.** The restore is gated on the clipboard sequence number: if a third party took the clipboard between our write and the restore, the restore is skipped rather than clobbering their content. Tools that restore unconditionally are the ones that paste your *previous* clipboard.
+## 4. The clipboard restore races the target's read
+
+This is the defect behind Handy issue #502 (open since 2025-12-30, 52 comments, no fix; the shipped mitigation is a delay slider, and users report it still failing at 400 ms).
+
+A target reads the clipboard *asynchronously*, whenever its message pump gets to the paste. An injector that restores the previous clipboard on a fixed timer restores before a busy target has read, and the target then reads the restored — old — content. Every fixed delay is a guess, and tuning it upward only moves the threshold.
+
+**Delayed rendering removes the guess.** Instead of publishing the text, publish a promise: `SetClipboardData(CF_UNICODETEXT, NULL)` with a hidden owner window. Windows sends `WM_RENDERFORMAT` to that window at the instant a consumer actually asks for the data. That message *is* the "target has read it" signal, so the restore is sequenced strictly after the read instead of racing it.
+
+```
+cargo run --example repro_502
+```
+
+Measured against a real window with a controllable message-pump lag, 120 ms restore delay:
+
+| algorithm | 10 ms | 60 ms | 150 ms | 400 ms | clipboard restored |
+|---|---|---|---|---|---|
+| unconditional restore (what everyone ships) | ok | ok | **wrong text** | **wrong text** | yes |
+| sequence-number gated restore | ok | ok | **wrong text** | **wrong text** | yes |
+| no restore | ok | ok | ok | ok | **no — user's clipboard destroyed** |
+| **delayed render** | ok | ok | ok | ok | **yes** |
+
+Note the second row: gating the restore on the clipboard sequence number does **not** fix this. The sequence number is still ours, because nobody else wrote — we clobber ourselves. The sequence gate solves a different problem (a third party taking the clipboard mid-paste) and is kept for that reason.
 
 ## Status
 
-Early. The clipboard, modifier, and integrity paths are implemented and tested; per-app profiles are a small static table so far.
+Early. Clipboard privacy formats, modifier sanitization, integrity checks, and delayed rendering are implemented and tested. Per-app paste-chord selection is a small static table so far.
+
+Known gaps: `Strategy::UnicodeType` is not yet exercised against a real window; there is no fallback chain when `SendInput` is blocked mid-paste; no CI.
 
 ## License
 

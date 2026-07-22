@@ -13,9 +13,14 @@ windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
-    "Win32_System_Memory",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Gdi",
     "Win32_System_Threading",
     "Win32_Security",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# Examples build a real Win32 window; the library itself needs no GDI.
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.61", features = ["Win32_Graphics_Gdi"] }

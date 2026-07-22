@@ -10,6 +10,9 @@
 //!    construction when injection fires. See [`modifiers::sanitize`].
 //! 3. **Injection into elevated windows fails silently.** UIPI blocks it and reports nothing
 //!    through `GetLastError` or the return value, so text vanishes. See [`Target::accepts_injection`].
+//! 4. **The clipboard restore races the target's read.** A target reads the clipboard whenever its
+//!    message pump gets to the paste, so a timer-based restore can win and the target then reads
+//!    the *previous* clipboard. Any fixed delay is a guess. See [`delayed`].
 //!
 //! # Example
 //!
@@ -31,10 +34,12 @@
 #![cfg(windows)]
 
 pub mod clipboard;
+pub mod delayed;
 pub mod modifiers;
 pub mod sendinput;
 mod target;
 
+pub use delayed::Offer;
 pub use sendinput::{type_text, INJECT_TAG};
 pub use target::{Integrity, Target};
 
@@ -57,6 +62,8 @@ pub enum Error {
     SendInputBlocked,
     /// Focus moved between capture and injection.
     FocusChanged,
+    /// The hidden clipboard-owner window could not be created.
+    OwnerWindowFailed,
 }
 
 impl std::fmt::Display for Error {
@@ -68,6 +75,7 @@ impl std::fmt::Display for Error {
             Error::Alloc(e) => write!(f, "global allocation failed: {e}"),
             Error::SendInputBlocked => write!(f, "SendInput was blocked, most likely by UIPI"),
             Error::FocusChanged => write!(f, "focus moved away from the captured target"),
+            Error::OwnerWindowFailed => write!(f, "clipboard owner window could not be created"),
         }
     }
 }
@@ -89,8 +97,12 @@ impl Chord {
     /// as needing Shift+Insert instead.
     pub fn for_exe(exe: &str) -> Self {
         match exe {
-            "windowsterminal.exe" | "conhost.exe" | "mintty.exe" | "putty.exe"
-            | "alacritty.exe" | "wezterm-gui.exe" => Chord::CtrlShiftV,
+            "windowsterminal.exe"
+            | "conhost.exe"
+            | "mintty.exe"
+            | "putty.exe"
+            | "alacritty.exe"
+            | "wezterm-gui.exe" => Chord::CtrlShiftV,
             "code.exe" | "cursor.exe" | "windsurf.exe" => Chord::ShiftInsert,
             _ => Chord::CtrlV,
         }

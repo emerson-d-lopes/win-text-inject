@@ -20,7 +20,14 @@ use crate::Error;
 
 /// Every modifier that can alter the meaning of a synthesized chord.
 const MODIFIERS: [VIRTUAL_KEY; 8] = [
-    VK_LSHIFT, VK_RSHIFT, VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU, VK_LWIN, VK_RWIN,
+    VK_LSHIFT,
+    VK_RSHIFT,
+    VK_LCONTROL,
+    VK_RCONTROL,
+    VK_LMENU,
+    VK_RMENU,
+    VK_LWIN,
+    VK_RWIN,
 ];
 
 /// High bit of `GetAsyncKeyState` means the key is currently physically down.
