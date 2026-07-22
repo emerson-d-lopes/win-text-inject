@@ -138,11 +138,26 @@ pub struct Options {
     /// Settle time between writing the clipboard and sending the paste chord.
     pub pre_paste: Duration,
     /// Time allowed for the target to read the clipboard before restoring it.
+    ///
+    /// Only consulted when [`Options::delayed_render`] is off. With delayed rendering the restore
+    /// is triggered by the target's actual read, so there is no delay to tune.
     pub post_paste: Duration,
     /// Restore the previous clipboard contents after pasting.
     pub restore_clipboard: bool,
     /// Abort if focus left the captured target.
     pub require_same_target: bool,
+    /// Publish the text as a delayed-render promise and restore once the target actually reads it.
+    ///
+    /// On by default. Turning this off falls back to the timer-based restore that every other tool
+    /// ships, which loses the transcript when the target is slower than `post_paste`.
+    pub delayed_render: bool,
+    /// How long to wait for the target to read the clipboard before giving up.
+    pub read_timeout: Duration,
+    /// After the first read, how long reads must stay quiet before the clipboard is restored.
+    ///
+    /// Consumers may read more than once per paste. This is not a race-the-target delay -- it
+    /// starts from an observed read, so it does not need to be tuned per machine.
+    pub read_quiet: Duration,
 }
 
 impl Default for Options {
@@ -154,6 +169,9 @@ impl Default for Options {
             post_paste: Duration::from_millis(120),
             restore_clipboard: true,
             require_same_target: true,
+            delayed_render: true,
+            read_timeout: Duration::from_secs(3),
+            read_quiet: Duration::from_millis(400),
         }
     }
 }
@@ -161,8 +179,12 @@ impl Default for Options {
 /// What actually happened, so the caller can tell the user the truth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// Text was pasted into the target.
-    Pasted,
+    /// A paste chord was sent.
+    ///
+    /// `read_confirmed` is true only when the target was observed reading the clipboard, which
+    /// delayed rendering makes knowable. When it is false the paste may not have landed — worth
+    /// surfacing rather than assuming success, which is what every other tool does.
+    Pasted { read_confirmed: bool },
     /// Text was typed directly into the target.
     Typed,
     /// Text is on the clipboard but was not delivered; the user must paste it.
@@ -216,25 +238,51 @@ pub fn inject(target: &Target, text: &str, options: Options) -> Result<Outcome, 
                 None
             };
 
+            let chord = options.chord.unwrap_or_else(|| Chord::for_exe(&target.exe));
+
+            if options.delayed_render {
+                // Publish a promise rather than the text. Windows reports the target's actual read,
+                // so the restore is sequenced after it instead of racing a timer.
+                let offer = delayed::Offer::publish(text)?;
+                std::thread::sleep(options.pre_paste);
+                modifiers::sanitize()?;
+                send_chord(chord)?;
+
+                // Not wait_for_read: one render does not mean the paste finished. Chromium probes
+                // the clipboard before the read that actually populates the field, so restoring
+                // after the first render reintroduces the very bug this path exists to fix.
+                let reads =
+                    offer.wait_for_reads_to_settle(options.read_timeout, options.read_quiet);
+                let read_confirmed = reads.is_some();
+
+                // Restoring after a timeout would be guessing again, and would destroy the user's
+                // clipboard for a paste that never landed. Leave the transcript in place instead.
+                if read_confirmed {
+                    if let Some(snapshot) = snapshot {
+                        let _ = snapshot.restore();
+                    }
+                }
+                return Ok(Outcome::Pasted { read_confirmed });
+            }
+
             clipboard::set_text_private(text)?;
             let ours = clipboard::sequence_number();
 
             std::thread::sleep(options.pre_paste);
-
             modifiers::sanitize()?;
-            let chord = options.chord.unwrap_or_else(|| Chord::for_exe(&target.exe));
             send_chord(chord)?;
-
             std::thread::sleep(options.post_paste);
 
-            // Only restore when the clipboard still holds our write. If a third party has taken it
-            // since, restoring would clobber their content -- this is the race that produces the
-            // "it pasted my old clipboard" bug in tools that restore unconditionally.
+            // Only restore when the clipboard still holds our write, so a third party that took the
+            // clipboard mid-paste is not clobbered. Note this does NOT prevent the target from
+            // reading the restored value -- only delayed rendering does.
             if let Some(snapshot) = snapshot {
                 let _ = snapshot.restore_if_ours(ours);
             }
 
-            Ok(Outcome::Pasted)
+            Ok(Outcome::Pasted {
+                read_confirmed: false,
+            })
         }
     }
 }
@@ -287,7 +335,10 @@ mod tests {
 
     #[test]
     fn only_clipboard_only_requires_manual_paste() {
-        assert!(!Outcome::Pasted.needs_manual_paste());
+        assert!(!Outcome::Pasted {
+            read_confirmed: true
+        }
+        .needs_manual_paste());
         assert!(!Outcome::Typed.needs_manual_paste());
         assert!(Outcome::ClipboardOnly(ClipboardOnlyReason::ElevatedTarget).needs_manual_paste());
     }
@@ -298,6 +349,21 @@ mod tests {
         assert!(o.restore_clipboard);
         assert!(o.require_same_target);
         assert_eq!(o.strategy, Strategy::ClipboardPaste);
+    }
+
+    #[test]
+    fn delayed_render_is_the_default() {
+        // The timer path is the known-broken one; it must be opt-in, not the default.
+        assert!(Options::default().delayed_render);
+    }
+
+    #[test]
+    fn timer_path_cannot_confirm_a_read() {
+        // Only the delayed-render path can know the target actually read the clipboard.
+        assert!(!Outcome::Pasted {
+            read_confirmed: false
+        }
+        .needs_manual_paste());
     }
 
     #[test]

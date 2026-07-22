@@ -176,7 +176,21 @@ impl Snapshot {
         unsafe { GetClipboardSequenceNumber() != self.sequence }
     }
 
-    /// Restore the captured text.
+    /// Restore the captured text unconditionally.
+    ///
+    /// Correct only when the caller already knows the target has read the clipboard — i.e. after
+    /// [`crate::delayed::Offer::wait_for_read`] returned true. Otherwise use [`Snapshot::restore_if_ours`].
+    pub fn restore(&self) -> Result<(), Error> {
+        match &self.text {
+            Some(text) => set_text_private(text),
+            None => {
+                let _guard = ClipboardGuard::open()?;
+                unsafe { EmptyClipboard().map_err(Error::Clipboard) }
+            }
+        }
+    }
+
+    /// Restore the captured text only if the clipboard still holds our own write.
     ///
     /// `expected` is the sequence number produced by our own write. If the live sequence number is
     /// neither our write nor the original, a third party owns the clipboard and restoring would

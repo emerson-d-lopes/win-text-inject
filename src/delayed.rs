@@ -42,6 +42,13 @@ struct State {
     pending: Option<String>,
     /// Set when a consumer actually requested the data.
     rendered: bool,
+    /// How many times the data has been requested since publishing.
+    ///
+    /// Consumers are not guaranteed to read exactly once. Chromium in particular touches the
+    /// clipboard more than once per paste, so the first render is not proof the paste completed.
+    render_count: u32,
+    /// Tick of the most recent render, for debouncing the restore.
+    last_render: Option<std::time::Instant>,
 }
 
 fn state() -> &'static (Mutex<State>, Condvar) {
@@ -51,6 +58,8 @@ fn state() -> &'static (Mutex<State>, Condvar) {
             Mutex::new(State {
                 pending: None,
                 rendered: false,
+                render_count: 0,
+                last_render: None,
             }),
             Condvar::new(),
         )
@@ -106,6 +115,8 @@ fn render(format: u32) {
     }
 
     s.rendered = true;
+    s.render_count += 1;
+    s.last_render = Some(std::time::Instant::now());
     cvar.notify_all();
 }
 
@@ -199,6 +210,8 @@ impl Offer {
             let mut s = lock.lock().map_err(|_| Error::OwnerWindowFailed)?;
             s.pending = Some(text.to_owned());
             s.rendered = false;
+            s.render_count = 0;
+            s.last_render = None;
         }
 
         {
@@ -245,6 +258,40 @@ impl Offer {
             return false;
         };
         guard.rendered
+    }
+
+    /// Wait for the first read, then until reads have been quiet for `quiet`.
+    ///
+    /// A single `WM_RENDERFORMAT` is *not* proof the paste completed. Chromium touches the
+    /// clipboard more than once per paste — an early probe, then the real read — so restoring after
+    /// the first render puts the old text back before the read that matters, which is precisely the
+    /// bug this was meant to fix. Waiting for renders to go quiet covers multi-read consumers.
+    ///
+    /// Returns the number of reads observed, or `None` if none arrived within `timeout`.
+    pub fn wait_for_reads_to_settle(&self, timeout: Duration, quiet: Duration) -> Option<u32> {
+        if !self.wait_for_read(timeout) {
+            return None;
+        }
+        loop {
+            let last = {
+                let (lock, _) = state();
+                let s = lock.lock().ok()?;
+                s.last_render?
+            };
+            let elapsed = last.elapsed();
+            if elapsed >= quiet {
+                break;
+            }
+            std::thread::sleep(quiet - elapsed);
+        }
+        let (lock, _) = state();
+        let s = lock.lock().ok()?;
+        Some(s.render_count)
+    }
+
+    /// Number of times a consumer has asked for the data since publishing.
+    pub fn read_count(&self) -> u32 {
+        state().0.lock().map(|s| s.render_count).unwrap_or(0)
     }
 }
 

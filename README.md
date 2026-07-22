@@ -92,6 +92,18 @@ Measured against a real window with a controllable message-pump lag, 120 ms rest
 
 Note the second row: gating the restore on the clipboard sequence number does **not** fix this. The sequence number is still ours, because nobody else wrote — we clobber ourselves. The sequence gate solves a different problem (a third party taking the clipboard mid-paste) and is kept for that reason.
 
+### One render is not enough
+
+The synthetic harness above reads the clipboard exactly once. Real applications do not.
+
+Tested against real Chrome, restoring after the first `WM_RENDERFORMAT` **still delivered the old clipboard**. Chromium touches the clipboard more than once per paste — an early probe, then the read that actually populates the field — so a restore fired after the first render lands between the two, which is the original bug wearing a different hat.
+
+The fix is to wait for renders to go *quiet*, not for the first one: `Offer::wait_for_reads_to_settle`. This is not a race-the-target delay — the clock starts from an observed read, so it does not need per-machine tuning.
+
+Verified end to end against Chrome: transcript delivered to the textarea, previous clipboard restored, read confirmed. `cargo run --example real_app_test -- --attach chrome.exe`.
+
+Note `WM_GETTEXT` cannot read Chromium or modern WinUI text, so the harness reports INDETERMINATE for those and the field must be checked directly.
+
 ## Status
 
 Early. Clipboard privacy formats, modifier sanitization, integrity checks, and delayed rendering are implemented and tested. Per-app paste-chord selection is a small static table so far.

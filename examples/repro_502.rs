@@ -242,8 +242,13 @@ fn trial(algorithm: Algorithm, consumer_lag_ms: u64, post_paste_ms: u64) -> (Opt
                 // No guessing: this returns the moment the target actually reads the clipboard.
                 let read = offer
                     .as_ref()
-                    .map(|o| o.wait_for_read(Duration::from_secs(3)))
-                    .unwrap_or(false);
+                    .and_then(|o| {
+                        o.wait_for_reads_to_settle(
+                            Duration::from_secs(3),
+                            Duration::from_millis(400),
+                        )
+                    })
+                    .is_some();
                 READ_SIGNALLED.store(read, Ordering::SeqCst);
                 if read {
                     let r = win_text_inject::clipboard::set_text_private(OLD);
