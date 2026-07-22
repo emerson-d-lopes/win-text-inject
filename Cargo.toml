@@ -1,0 +1,21 @@
+[package]
+name = "win-text-inject"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+description = "Correct text injection into the focused Windows application: clipboard privacy formats, modifier sanitization, and integrity-level checks."
+keywords = ["windows", "clipboard", "sendinput", "dictation", "accessibility"]
+categories = ["os::windows-apis", "text-processing"]
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

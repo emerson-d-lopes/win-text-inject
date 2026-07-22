@@ -1,0 +1,297 @@
+//! Correct text injection into the focused Windows application.
+//!
+//! Every open-source dictation tool surveyed in July 2026 delivers text the same way: save the
+//! clipboard, overwrite it, synthesize Ctrl+V, `sleep()`, restore. That approach has three defects
+//! that this crate exists to fix.
+//!
+//! 1. **Transcripts leak into clipboard history and the Microsoft cloud clipboard.** Writing
+//!    `CF_UNICODETEXT` alone opts into both. See [`clipboard::set_text_private`].
+//! 2. **Held modifiers corrupt the synthesized chord.** In push-to-talk a modifier is held by
+//!    construction when injection fires. See [`modifiers::sanitize`].
+//! 3. **Injection into elevated windows fails silently.** UIPI blocks it and reports nothing
+//!    through `GetLastError` or the return value, so text vanishes. See [`Target::accepts_injection`].
+//!
+//! # Example
+//!
+//! ```no_run
+//! # fn main() -> Result<(), win_text_inject::Error> {
+//! // Capture at hotkey press, so focus changes during dictation cannot misdirect the text.
+//! let target = win_text_inject::Target::foreground()?;
+//!
+//! // ... record and transcribe ...
+//!
+//! let outcome = win_text_inject::inject(&target, "hello world", Default::default())?;
+//! if outcome.needs_manual_paste() {
+//!     // Text is on the clipboard; tell the user to press Ctrl+V.
+//! }
+//! # Ok(())
+//! # }
+//! ```
+
+#![cfg(windows)]
+
+pub mod clipboard;
+pub mod modifiers;
+pub mod sendinput;
+mod target;
+
+pub use sendinput::{type_text, INJECT_TAG};
+pub use target::{Integrity, Target};
+
+use std::time::Duration;
+
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    VIRTUAL_KEY, VK_CONTROL, VK_INSERT, VK_SHIFT, VK_V,
+};
+
+/// Failures that are worth distinguishing at the call site.
+#[derive(Debug)]
+pub enum Error {
+    /// No foreground window, or it belongs to no process.
+    NoForegroundWindow,
+    /// Another process held the clipboard lock across every retry.
+    ClipboardLocked(windows::core::Error),
+    Clipboard(windows::core::Error),
+    Alloc(windows::core::Error),
+    /// `SendInput` accepted fewer events than submitted. Almost always UIPI.
+    SendInputBlocked,
+    /// Focus moved between capture and injection.
+    FocusChanged,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::NoForegroundWindow => write!(f, "no foreground window"),
+            Error::ClipboardLocked(e) => write!(f, "clipboard held by another process: {e}"),
+            Error::Clipboard(e) => write!(f, "clipboard operation failed: {e}"),
+            Error::Alloc(e) => write!(f, "global allocation failed: {e}"),
+            Error::SendInputBlocked => write!(f, "SendInput was blocked, most likely by UIPI"),
+            Error::FocusChanged => write!(f, "focus moved away from the captured target"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// Key combination used to trigger a paste in the target application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chord {
+    CtrlV,
+    CtrlShiftV,
+    ShiftInsert,
+}
+
+impl Chord {
+    /// The chord most likely to paste in the given application.
+    ///
+    /// Terminals bind Ctrl+V to something else or nothing; several Electron editors are documented
+    /// as needing Shift+Insert instead.
+    pub fn for_exe(exe: &str) -> Self {
+        match exe {
+            "windowsterminal.exe" | "conhost.exe" | "mintty.exe" | "putty.exe"
+            | "alacritty.exe" | "wezterm-gui.exe" => Chord::CtrlShiftV,
+            "code.exe" | "cursor.exe" | "windsurf.exe" => Chord::ShiftInsert,
+            _ => Chord::CtrlV,
+        }
+    }
+
+    fn keys(self) -> (&'static [VIRTUAL_KEY], VIRTUAL_KEY) {
+        match self {
+            Chord::CtrlV => (&[VK_CONTROL], VK_V),
+            Chord::CtrlShiftV => (&[VK_CONTROL, VK_SHIFT], VK_V),
+            Chord::ShiftInsert => (&[VK_SHIFT], VK_INSERT),
+        }
+    }
+}
+
+/// How text should be delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Strategy {
+    /// Clipboard plus a synthesized paste chord. Fast and correct for long text.
+    #[default]
+    ClipboardPaste,
+    /// Type the text as Unicode input. Slower, but works where paste is blocked.
+    UnicodeType,
+    /// Write the clipboard and stop, leaving the paste to the user.
+    ClipboardOnly,
+}
+
+/// Tunables. Defaults are deliberately conservative.
+#[derive(Debug, Clone, Copy)]
+pub struct Options {
+    pub strategy: Strategy,
+    /// Chord override. `None` selects per target executable.
+    pub chord: Option<Chord>,
+    /// Settle time between writing the clipboard and sending the paste chord.
+    pub pre_paste: Duration,
+    /// Time allowed for the target to read the clipboard before restoring it.
+    pub post_paste: Duration,
+    /// Restore the previous clipboard contents after pasting.
+    pub restore_clipboard: bool,
+    /// Abort if focus left the captured target.
+    pub require_same_target: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            strategy: Strategy::default(),
+            chord: None,
+            pre_paste: Duration::from_millis(30),
+            post_paste: Duration::from_millis(120),
+            restore_clipboard: true,
+            require_same_target: true,
+        }
+    }
+}
+
+/// What actually happened, so the caller can tell the user the truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Text was pasted into the target.
+    Pasted,
+    /// Text was typed directly into the target.
+    Typed,
+    /// Text is on the clipboard but was not delivered; the user must paste it.
+    ClipboardOnly(ClipboardOnlyReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardOnlyReason {
+    /// Caller asked for it.
+    Requested,
+    /// Target runs at a higher integrity level, so UIPI would discard the input.
+    ElevatedTarget,
+}
+
+impl Outcome {
+    /// True when the user has to paste manually for the text to arrive.
+    pub fn needs_manual_paste(self) -> bool {
+        matches!(self, Outcome::ClipboardOnly(_))
+    }
+}
+
+/// Deliver `text` to `target`.
+///
+/// Order matters: the elevation check happens before anything is written, and modifier
+/// sanitization happens before any synthesized chord.
+pub fn inject(target: &Target, text: &str, options: Options) -> Result<Outcome, Error> {
+    if options.require_same_target && !target.still_foreground() {
+        return Err(Error::FocusChanged);
+    }
+
+    // Refusing early is the whole point: injecting here would succeed silently and deliver nothing.
+    if !target.accepts_injection() {
+        clipboard::set_text_private(text)?;
+        return Ok(Outcome::ClipboardOnly(ClipboardOnlyReason::ElevatedTarget));
+    }
+
+    match options.strategy {
+        Strategy::ClipboardOnly => {
+            clipboard::set_text_private(text)?;
+            Ok(Outcome::ClipboardOnly(ClipboardOnlyReason::Requested))
+        }
+        Strategy::UnicodeType => {
+            modifiers::sanitize()?;
+            sendinput::type_text(text)?;
+            Ok(Outcome::Typed)
+        }
+        Strategy::ClipboardPaste => {
+            let snapshot = if options.restore_clipboard {
+                clipboard::Snapshot::capture().ok()
+            } else {
+                None
+            };
+
+            clipboard::set_text_private(text)?;
+            let ours = clipboard::sequence_number();
+
+            std::thread::sleep(options.pre_paste);
+
+            modifiers::sanitize()?;
+            let chord = options.chord.unwrap_or_else(|| Chord::for_exe(&target.exe));
+            send_chord(chord)?;
+
+            std::thread::sleep(options.post_paste);
+
+            // Only restore when the clipboard still holds our write. If a third party has taken it
+            // since, restoring would clobber their content -- this is the race that produces the
+            // "it pasted my old clipboard" bug in tools that restore unconditionally.
+            if let Some(snapshot) = snapshot {
+                let _ = snapshot.restore_if_ours(ours);
+            }
+
+            Ok(Outcome::Pasted)
+        }
+    }
+}
+
+fn send_chord(chord: Chord) -> Result<(), Error> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS;
+
+    let (mods, key) = chord.keys();
+    let mut inputs = Vec::with_capacity(mods.len() * 2 + 2);
+
+    for m in mods {
+        inputs.push(sendinput::tagged_keyboard_input(*m, KEYBD_EVENT_FLAGS(0)));
+    }
+    inputs.push(sendinput::tagged_keyboard_input(key, KEYBD_EVENT_FLAGS(0)));
+    inputs.push(modifiers::key_up(key));
+    for m in mods.iter().rev() {
+        inputs.push(modifiers::key_up(*m));
+    }
+
+    sendinput::send(&inputs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminals_get_ctrl_shift_v() {
+        assert_eq!(Chord::for_exe("windowsterminal.exe"), Chord::CtrlShiftV);
+        assert_eq!(Chord::for_exe("alacritty.exe"), Chord::CtrlShiftV);
+    }
+
+    #[test]
+    fn electron_editors_get_shift_insert() {
+        assert_eq!(Chord::for_exe("code.exe"), Chord::ShiftInsert);
+        assert_eq!(Chord::for_exe("cursor.exe"), Chord::ShiftInsert);
+    }
+
+    #[test]
+    fn unknown_apps_fall_back_to_ctrl_v() {
+        assert_eq!(Chord::for_exe("notepad.exe"), Chord::CtrlV);
+        assert_eq!(Chord::for_exe(""), Chord::CtrlV);
+    }
+
+    #[test]
+    fn chord_lookup_assumes_lowercased_input() {
+        // Target::foreground lowercases the exe name, so the table only needs lowercase keys.
+        assert_eq!(Chord::for_exe("Code.exe"), Chord::CtrlV);
+    }
+
+    #[test]
+    fn only_clipboard_only_requires_manual_paste() {
+        assert!(!Outcome::Pasted.needs_manual_paste());
+        assert!(!Outcome::Typed.needs_manual_paste());
+        assert!(Outcome::ClipboardOnly(ClipboardOnlyReason::ElevatedTarget).needs_manual_paste());
+    }
+
+    #[test]
+    fn defaults_restore_the_clipboard_and_pin_the_target() {
+        let o = Options::default();
+        assert!(o.restore_clipboard);
+        assert!(o.require_same_target);
+        assert_eq!(o.strategy, Strategy::ClipboardPaste);
+    }
+
+    #[test]
+    fn chord_key_sequences_are_well_formed() {
+        assert_eq!(Chord::CtrlV.keys().0.len(), 1);
+        assert_eq!(Chord::CtrlShiftV.keys().0.len(), 2);
+        assert_eq!(Chord::ShiftInsert.keys().1, VK_INSERT);
+    }
+}
