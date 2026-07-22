@@ -1,6 +1,15 @@
 # win-text-inject
 
+[![CI](https://github.com/emerson-d-lopes/win-text-inject/actions/workflows/ci.yml/badge.svg)](https://github.com/emerson-d-lopes/win-text-inject/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/win-text-inject.svg)](https://crates.io/crates/win-text-inject)
+[![docs.rs](https://docs.rs/win-text-inject/badge.svg)](https://docs.rs/win-text-inject)
+
 Correct text injection into the focused Windows application, for dictation and text-expansion tools.
+
+```toml
+[dependencies]
+win-text-inject = "0.1"
+```
 
 Every open-source dictation tool surveyed in July 2026 delivers text the same way: save the clipboard, overwrite it, synthesize Ctrl+V, `sleep()`, restore. That approach has three defects. This crate fixes them.
 

@@ -4,9 +4,17 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
 license = "MIT OR Apache-2.0"
-description = "Correct text injection into the focused Windows application: clipboard privacy formats, modifier sanitization, and integrity-level checks."
+description = "Deliver text into the focused Windows application correctly: clipboard privacy formats, modifier sanitization, integrity-level checks, and a delayed-render restore that does not race the target's read."
+repository = "https://github.com/emerson-d-lopes/win-text-inject"
+documentation = "https://docs.rs/win-text-inject"
+readme = "README.md"
 keywords = ["windows", "clipboard", "sendinput", "dictation", "accessibility"]
 categories = ["os::windows-apis", "text-processing"]
+exclude = ["/.github"]
+
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
+targets = ["x86_64-pc-windows-msvc"]
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
@@ -21,6 +29,6 @@ windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-# Examples build a real Win32 window; the library itself needs no GDI.
+# The examples build real Win32 windows and drive real applications.
 [target.'cfg(windows)'.dev-dependencies]
 windows = { version = "0.61", features = ["Win32_Graphics_Gdi"] }

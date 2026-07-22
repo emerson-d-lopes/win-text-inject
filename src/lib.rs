@@ -32,6 +32,8 @@
 //! ```
 
 #![cfg(windows)]
+#![warn(missing_docs)]
+#![warn(clippy::doc_markdown)]
 
 pub mod clipboard;
 pub mod delayed;
@@ -56,7 +58,9 @@ pub enum Error {
     NoForegroundWindow,
     /// Another process held the clipboard lock across every retry.
     ClipboardLocked(windows::core::Error),
+    /// A clipboard call failed after the clipboard was successfully opened.
     Clipboard(windows::core::Error),
+    /// `GlobalAlloc` or `GlobalLock` failed while preparing clipboard data.
     Alloc(windows::core::Error),
     /// `SendInput` accepted fewer events than submitted. Almost always UIPI.
     SendInputBlocked,
@@ -85,8 +89,11 @@ impl std::error::Error for Error {}
 /// Key combination used to trigger a paste in the target application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Chord {
+    /// The near-universal paste binding.
     CtrlV,
+    /// Terminals, where Ctrl+V is a control character or unbound.
     CtrlShiftV,
+    /// Legacy paste binding, still honored by some older Win32 software.
     ShiftInsert,
 }
 
@@ -134,6 +141,7 @@ pub enum Strategy {
 /// Tunables. Defaults are deliberately conservative.
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
+    /// How the text should be delivered.
     pub strategy: Strategy,
     /// Chord override. `None` selects per target executable.
     pub chord: Option<Chord>,
@@ -186,13 +194,17 @@ pub enum Outcome {
     /// `read_confirmed` is true only when the target was observed reading the clipboard, which
     /// delayed rendering makes knowable. When it is false the paste may not have landed — worth
     /// surfacing rather than assuming success, which is what every other tool does.
-    Pasted { read_confirmed: bool },
+    Pasted {
+        /// Whether Windows reported the target actually reading the clipboard.
+        read_confirmed: bool,
+    },
     /// Text was typed directly into the target.
     Typed,
     /// Text is on the clipboard but was not delivered; the user must paste it.
     ClipboardOnly(ClipboardOnlyReason),
 }
 
+/// Why the text was left on the clipboard instead of being delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipboardOnlyReason {
     /// Caller asked for it.

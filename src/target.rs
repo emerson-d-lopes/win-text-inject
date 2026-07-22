@@ -28,12 +28,19 @@ use crate::Error;
 /// Windows integrity levels, ordered. Comparison is what matters, not the raw RID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Integrity {
+    /// Below Low. Used by heavily sandboxed processes.
     Untrusted,
+    /// Sandboxed processes, e.g. browser renderers and protected-mode content.
     Low,
+    /// Ordinary user processes. Where a dictation app normally runs.
     Medium,
+    /// Between Medium and High; used by some UAC-aware processes.
     MediumPlus,
+    /// Elevated (administrator) processes. UIPI blocks input from Medium into these.
     High,
+    /// Service and kernel-adjacent processes.
     System,
+    /// Protected-process level, above anything a desktop app can reach.
     Protected,
 }
 
@@ -62,12 +69,15 @@ impl Integrity {
 /// in the wrong application.
 #[derive(Debug, Clone)]
 pub struct Target {
+    /// Raw `HWND` of the captured foreground window.
     pub hwnd: isize,
+    /// Process that owns the window.
     pub pid: u32,
     /// Lowercased executable file name, e.g. `code.exe`. Empty when it could not be read.
     pub exe: String,
     /// Real window class of the foreground window, e.g. `Chrome_RenderWidgetHostHWND`.
     pub class: String,
+    /// Integrity level of the owning process. Determines whether `SendInput` can reach it.
     pub integrity: Integrity,
 }
 

@@ -21,7 +21,7 @@ use crate::Error;
 const CF_UNICODETEXT: u32 = 13;
 
 /// Opt-out formats honored by Windows clipboard history, the cloud clipboard, and well-behaved
-/// third-party managers (KeePassXC and Windows Credential Manager use the same set).
+/// third-party managers. Password managers and Windows Credential Manager use the same set.
 const PRIVACY_FORMATS: [PCWSTR; 4] = [
     w!("ExcludeClipboardContentFromMonitorProcessing"),
     w!("CanIncludeInClipboardHistory"),
@@ -159,6 +159,7 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Capture the clipboard's current text and sequence number.
     pub fn capture() -> Result<Self, Error> {
         let _guard = ClipboardGuard::open()?;
         let sequence = unsafe { GetClipboardSequenceNumber() };
