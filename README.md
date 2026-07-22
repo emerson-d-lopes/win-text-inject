@@ -11,7 +11,29 @@ Correct text injection into the focused Windows application, for dictation and t
 win-text-inject = "0.1"
 ```
 
-Every open-source dictation tool surveyed in July 2026 delivers text the same way: save the clipboard, overwrite it, synthesize Ctrl+V, `sleep()`, restore. That approach has three defects. This crate fixes them.
+Every open-source dictation tool surveyed in July 2026 delivers text the same way: save the clipboard, overwrite it, synthesize Ctrl+V, `sleep()`, restore. That approach has four defects. This crate fixes them.
+
+## How it works
+
+```mermaid
+flowchart TD
+    A["inject(target, text)"] --> B{"target still focused?"}
+    B -- no --> B1["Err: FocusChanged"]
+    B -- yes --> C{"target integrity<br/>at or below ours?"}
+    C -- no --> C1["clipboard only<br/>Outcome::ClipboardOnly"]
+    C -- yes --> D["publish delayed-render promise<br/>+ 4 privacy formats"]
+    D --> E["release physically held modifiers"]
+    E --> F["mark paste sent<br/>reads before this do not count"]
+    F --> G["send paste chord"]
+    G --> H{"a read arrived<br/>after the mark?"}
+    H -- yes --> I["wait for reads to go quiet"]
+    I --> J["restore previous clipboard<br/>read_confirmed: true"]
+    H -- no --> K{"promise consumed<br/>before the paste?"}
+    K -- yes --> L["timer fallback, then restore<br/>read_confirmed: false"]
+    K -- no --> M["paste never landed:<br/>leave transcript on clipboard"]
+```
+
+The interesting branch is `H`. Everything else is bookkeeping around it.
 
 ## 1. Transcripts leak into clipboard history and the Microsoft cloud clipboard
 
@@ -48,43 +70,53 @@ Per MSDN on `SendInput`:
 
 So the text simply vanishes. `Target::accepts_injection` compares integrity levels in microseconds and lets the caller degrade honestly — leave the text on the clipboard and say so — instead of losing it.
 
-## Usage
-
-```rust
-use win_text_inject::{inject, Options, Target};
-
-// Capture at hotkey PRESS, not at injection time. Between press and release the user may have
-// changed focus, and injecting into whatever is foreground later is how text lands in the wrong app.
-let target = Target::foreground()?;
-
-// ... record and transcribe ...
-
-let outcome = inject(&target, &transcript, Options::default())?;
-if outcome.needs_manual_paste() {
-    // Text is on the clipboard; prompt the user to press Ctrl+V.
-}
-# Ok::<(), win_text_inject::Error>(())
-```
-
-`Chord::for_exe` picks the paste chord per target: Ctrl+Shift+V for terminals, Shift+Insert for VS Code / Cursor / Windsurf, Ctrl+V otherwise.
-
-### Interaction with a low-level keyboard hook
-
-Every event this crate synthesizes carries `INJECT_TAG` in `dwExtraInfo`. If your app installs a `WH_KEYBOARD_LL` hook to detect its hotkey, skip events whose `dwExtraInfo` equals `INJECT_TAG` in addition to checking `LLKHF_INJECTED`, or the synthesized paste chord will re-enter your own hook.
-
-## What this crate does not do
-
-**It does not use UI Automation.** UIA cannot insert text — per Microsoft, TextPattern *"does not provide a means to insert or modify text"* and is *"a read-only solution"*, while `ValuePattern::SetValue` replaces the entire control value and ignores the caret. Touching UIA also causes Chromium to enable its accessibility tree process-wide, imposing a permanent performance cost on every Chrome and Electron process on the machine.
-
-**It does not implement a TSF text service.** Text Services Framework is the API Microsoft actually recommends for dictation, and it is how Win+H and Voice Access inject so cleanly. But TSF insertion requires being a TIP loaded in-process inside every target application — an in-proc COM DLL, registered, built per architecture, signed. That is a separate project.
-
 ## 4. The clipboard restore races the target's read
 
 This is the defect behind Handy issue #502 (open since 2025-12-30, 52 comments, no fix; the shipped mitigation is a delay slider, and users report it still failing at 400 ms).
 
 A target reads the clipboard *asynchronously*, whenever its message pump gets to the paste. An injector that restores the previous clipboard on a fixed timer restores before a busy target has read, and the target then reads the restored — old — content. Every fixed delay is a guess, and tuning it upward only moves the threshold.
 
-**Delayed rendering removes the guess.** Instead of publishing the text, publish a promise: `SetClipboardData(CF_UNICODETEXT, NULL)` with a hidden owner window. Windows sends `WM_RENDERFORMAT` to that window at the instant a consumer actually asks for the data. That message *is* the "target has read it" signal, so the restore is sequenced strictly after the read instead of racing it.
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Dictation app
+    participant CB as Clipboard
+    participant T as Target app
+    App->>CB: save previous contents
+    App->>CB: write transcript
+    App->>T: synthesize Ctrl+V
+    Note over T: busy, paste sits in the message queue
+    App-->>App: sleep(120 ms)
+    App->>CB: restore previous contents
+    T->>CB: read, finally
+    CB-->>T: previous contents
+    Note over T: user gets the wrong text
+```
+
+**Delayed rendering removes the guess.** Instead of publishing the text, publish a promise: `SetClipboardData(CF_UNICODETEXT, NULL)` with a hidden owner window. The clipboard now advertises that unicode text is available while holding nothing. Windows sends `WM_RENDERFORMAT` to that window at the instant a consumer actually asks for the data, and the owner supplies it then.
+
+That message *is* the "target has read it" signal, so the restore is sequenced strictly after the read instead of racing it. There is no delay constant anywhere in this path.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Dictation app
+    participant Own as Hidden owner window
+    participant CB as Clipboard
+    participant T as Target app
+    App->>CB: save previous contents
+    App->>CB: SetClipboardData(CF_UNICODETEXT, NULL)
+    Note over CB: a promise, no data yet
+    App->>T: synthesize Ctrl+V
+    Note over T: busy, paste sits in the message queue
+    T->>CB: read, finally
+    CB->>Own: WM_RENDERFORMAT
+    Own->>CB: supply the transcript now
+    CB-->>T: transcript
+    Own-->>App: read observed
+    Note over App: only now, and only after<br/>reads go quiet
+    App->>CB: restore previous contents
+```
 
 ```
 cargo run --example repro_502
@@ -122,6 +154,21 @@ The fix is to wait for renders to go *quiet*, not for the first one: `Offer::wai
 
 Every chord in the table is verified this way, not taken from documentation. VS Code was originally listed as needing Shift+Insert on the strength of a vendor support page; testing showed Shift+Insert does nothing in the editor — the paste never fires at all. That advice appears to describe the integrated terminal.
 
+### Verified with real speech
+
+The table above drives applications directly. That is still a harness. The whole path has also been run inside a real dictation app, with a microphone and a person talking, which found a bug nothing above could:
+
+`SetClipboardData` returns NULL on success when publishing a delayed-render promise, so the bindings report it as an error. The guard for that trusted `GetLastError` — but Win32 does not reset the thread's last error on success, so a stale code from an unrelated earlier call read as a failure that never happened. Roughly one paste in four aborted to the fallback path.
+
+Fixed in 0.1.1 by ignoring the return value entirely and establishing success from observable clipboard state instead: we own the clipboard, and `CF_UNICODETEXT` is advertised.
+
+| version | real dictations | fell back to timer |
+|---|---|---|
+| 0.1.0 | 5 | 1 |
+| 0.1.1 | 4 | 0 |
+
+Small sample, presented as such. The previous clipboard survived every dictation in both runs, which is the behaviour that matters here.
+
 ### Clipboard managers
 
 A manager that reads the clipboard on every change interacts with delayed rendering in a way worth stating plainly. Tested with `examples/fake_clipboard_manager.rs` in both modes.
@@ -137,11 +184,41 @@ Case 2 is why `mark_paste_sent` exists: reads before the paste are ignored, so a
 
 If no read is observed at all, the paste most likely never landed, so the transcript is deliberately left on the clipboard rather than discarded.
 
+## Usage
+
+```rust
+use win_text_inject::{inject, Options, Target};
+
+// Capture at hotkey PRESS, not at injection time. Between press and release the user may have
+// changed focus, and injecting into whatever is foreground later is how text lands in the wrong app.
+let target = Target::foreground()?;
+
+// ... record and transcribe ...
+
+let outcome = inject(&target, &transcript, Options::default())?;
+if outcome.needs_manual_paste() {
+    // Text is on the clipboard; prompt the user to press Ctrl+V.
+}
+# Ok::<(), win_text_inject::Error>(())
+```
+
+`Chord::for_exe` picks the paste chord per target: Ctrl+Shift+V for terminals, Ctrl+V otherwise. Every entry is verified against the running application rather than taken from documentation — see [Verified against real applications](#verified-against-real-applications).
+
+### Interaction with a low-level keyboard hook
+
+Every event this crate synthesizes carries `INJECT_TAG` in `dwExtraInfo`. If your app installs a `WH_KEYBOARD_LL` hook to detect its hotkey, skip events whose `dwExtraInfo` equals `INJECT_TAG` in addition to checking `LLKHF_INJECTED`, or the synthesized paste chord will re-enter your own hook.
+
+## What this crate does not do
+
+**It does not use UI Automation.** UIA cannot insert text — per Microsoft, TextPattern *"does not provide a means to insert or modify text"* and is *"a read-only solution"*, while `ValuePattern::SetValue` replaces the entire control value and ignores the caret. Touching UIA also causes Chromium to enable its accessibility tree process-wide, imposing a permanent performance cost on every Chrome and Electron process on the machine.
+
+**It does not implement a TSF text service.** Text Services Framework is the API Microsoft actually recommends for dictation, and it is how Win+H and Voice Access inject so cleanly. But TSF insertion requires being a TIP loaded in-process inside every target application — an in-proc COM DLL, registered, built per architecture, signed. That is a separate project.
+
 ## Status
 
-Early. Clipboard privacy formats, modifier sanitization, integrity checks, and delayed rendering are implemented and tested. Per-app paste-chord selection is a small static table so far.
+Early. Clipboard privacy formats, modifier sanitization, integrity checks, and delayed rendering are implemented and tested, and the whole path has been driven through a real dictation app with real speech. Per-app paste-chord selection is a small static table so far.
 
-Known gaps: `Strategy::UnicodeType` is not yet exercised against a real window; there is no fallback chain when `SendInput` is blocked mid-paste; no CI.
+Known gaps: `Strategy::UnicodeType` is not yet exercised against a real window, and there is no fallback chain when `SendInput` is blocked mid-paste. Untested on Windows on ARM, over RDP/Citrix/VDI, against games and other raw-input consumers, and on Windows 10.
 
 ## License
 
