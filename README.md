@@ -220,6 +220,13 @@ Early. Clipboard privacy formats, modifier sanitization, integrity checks, and d
 
 Known gaps: `Strategy::UnicodeType` is not yet exercised against a real window, and there is no fallback chain when `SendInput` is blocked mid-paste. Untested on Windows on ARM, over RDP/Citrix/VDI, against games and other raw-input consumers, and on Windows 10.
 
+## Used by
+
+[dictate](https://github.com/emerson-d-lopes/dictate), a push-to-talk dictation tool for
+Windows, uses this crate for its final text-delivery step. The same fix was contributed
+upstream to [Handy](https://github.com/cjpais/Handy/pull/1770).
+
 ## License
 
 MIT OR Apache-2.0
+
