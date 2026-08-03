@@ -15,23 +15,7 @@ Every open-source dictation tool surveyed in July 2026 delivers text the same wa
 
 ## How it works
 
-```mermaid
-flowchart TD
-    A["inject(target, text)"] --> B{"target still focused?"}
-    B -- no --> B1["Err: FocusChanged"]
-    B -- yes --> C{"target integrity<br/>at or below ours?"}
-    C -- no --> C1["clipboard only<br/>Outcome::ClipboardOnly"]
-    C -- yes --> D["publish delayed-render promise<br/>+ 4 privacy formats"]
-    D --> E["release physically held modifiers"]
-    E --> F["mark paste sent<br/>reads before this do not count"]
-    F --> G["send paste chord"]
-    G --> H{"a read arrived<br/>after the mark?"}
-    H -- yes --> I["wait for reads to go quiet"]
-    I --> J["restore previous clipboard<br/>read_confirmed: true"]
-    H -- no --> K{"promise consumed<br/>before the paste?"}
-    K -- yes --> L["timer fallback, then restore<br/>read_confirmed: false"]
-    K -- no --> M["paste never landed:<br/>leave transcript on clipboard"]
-```
+![inject decision flow](docs/inject-flow.png)
 
 The interesting branch is `H`. Everything else is bookkeeping around it.
 
@@ -76,47 +60,11 @@ This is the defect behind Handy issue #502 (open since 2025-12-30, 52 comments, 
 
 A target reads the clipboard *asynchronously*, whenever its message pump gets to the paste. An injector that restores the previous clipboard on a fixed timer restores before a busy target has read, and the target then reads the restored — old — content. Every fixed delay is a guess, and tuning it upward only moves the threshold.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant App as Dictation app
-    participant CB as Clipboard
-    participant T as Target app
-    App->>CB: save previous contents
-    App->>CB: write transcript
-    App->>T: synthesize Ctrl+V
-    Note over T: busy, paste sits in the message queue
-    App-->>App: sleep(120 ms)
-    App->>CB: restore previous contents
-    T->>CB: read, finally
-    CB-->>T: previous contents
-    Note over T: user gets the wrong text
-```
-
 **Delayed rendering removes the guess.** Instead of publishing the text, publish a promise: `SetClipboardData(CF_UNICODETEXT, NULL)` with a hidden owner window. The clipboard now advertises that unicode text is available while holding nothing. Windows sends `WM_RENDERFORMAT` to that window at the instant a consumer actually asks for the data, and the owner supplies it then.
 
 That message *is* the "target has read it" signal, so the restore is sequenced strictly after the read instead of racing it. There is no delay constant anywhere in this path.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant App as Dictation app
-    participant Own as Hidden owner window
-    participant CB as Clipboard
-    participant T as Target app
-    App->>CB: save previous contents
-    App->>CB: SetClipboardData(CF_UNICODETEXT, NULL)
-    Note over CB: a promise, no data yet
-    App->>T: synthesize Ctrl+V
-    Note over T: busy, paste sits in the message queue
-    T->>CB: read, finally
-    CB->>Own: WM_RENDERFORMAT
-    Own->>CB: supply the transcript now
-    CB-->>T: transcript
-    Own-->>App: read observed
-    Note over App: only now, and only after<br/>reads go quiet
-    App->>CB: restore previous contents
-```
+![delayed-render restore sequence](docs/delayed-render.png)
 
 ```
 cargo run --example repro_502
