@@ -15,7 +15,12 @@ Every open-source dictation tool surveyed in July 2026 delivers text the same wa
 
 ## How it works
 
-![inject decision flow](docs/inject-flow.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/inject-flow-dark.svg">
+  <img alt="which path does inject() take, and what does the caller get back?" src="docs/inject-flow-light.svg">
+</picture>
+
+*which path does inject() take, and what does the caller get back?* a paste whose read never arrives leaves the transcript on the clipboard and says so, instead of restoring over it. the caller can always tell the user what happened.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.svg">
@@ -71,7 +76,12 @@ A target reads the clipboard *asynchronously*, whenever its message pump gets to
 
 That message *is* the "target has read it" signal, so the restore is sequenced strictly after the read instead of racing it. There is no delay constant anywhere in this path.
 
-![delayed-render restore sequence](docs/delayed-render.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/delayed-render-dark.svg">
+  <img alt="how does the injector learn that the target has actually read the clipboard?" src="docs/delayed-render-light.svg">
+</picture>
+
+*how does the injector learn that the target has actually read the clipboard?* one render is not enough: Chromium probes and then reads, so the restore waits for the reads to go quiet. a clipboard manager that consumes the promise before the chord is detected against a baseline taken when the chord is sent, and that one injection falls back to the timer.
 
 ```
 cargo run --example repro_502
