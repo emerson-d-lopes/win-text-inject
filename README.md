@@ -17,6 +17,13 @@ Every open-source dictation tool surveyed in July 2026 delivers text the same wa
 
 ![inject decision flow](docs/inject-flow.png)
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture-dark.svg">
+  <img alt="architecture: when is it safe to restore the clipboard after a paste?" src="docs/architecture-light.svg">
+</picture>
+
+*when is it safe to restore the clipboard after a paste?* the promise also carries four privacy formats so the transcript never enters clipboard history or the cloud clipboard. the integrity check runs before any write, so an elevated target gets an honest ClipboardOnly result instead of a silent loss.
+
 The interesting branch is `H`. Everything else is bookkeeping around it.
 
 ## 1. Transcripts leak into clipboard history and the Microsoft cloud clipboard
